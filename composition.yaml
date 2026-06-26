@@ -935,10 +935,6 @@ spec:
                   matchControllerRef: true
                   matchLabels:
                     resource: vpc
-                securityGroupIdSelector:
-                  matchControllerRef: true
-                  matchLabels:
-                    sg-for: vpc-endpoints
                 {{- if $eksSubnetIds }}
                 subnetIds:
                   {{- range $eksSubnetIds }}
