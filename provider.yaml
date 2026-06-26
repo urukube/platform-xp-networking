@@ -1,0 +1,12 @@
+---
+# Installs the EC2 sub-provider from the Upbound provider-family-aws.
+# The provider-aws-irsa DeploymentRuntimeConfig (created by orchestrator-custom-addons)
+# injects the IRSA role ARN onto the provider pod's service account.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: upbound-provider-aws-ec2
+spec:
+  package: xpkg.upbound.io/upbound/provider-aws-ec2:v1.21.0
+  runtimeConfigRef:
+    name: provider-aws-irsa

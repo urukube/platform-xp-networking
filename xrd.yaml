@@ -1,0 +1,153 @@
+---
+apiVersion: apiextensions.crossplane.io/v1
+kind: CompositeResourceDefinition
+metadata:
+  name: xuvpcs.networking.platform.urukube.io
+spec:
+  group: networking.platform.urukube.io
+  names:
+    kind: XUVpc
+    plural: xuvpcs
+  claimNames:
+    kind: UVpc
+    plural: uvpcs
+  versions:
+    - name: v1alpha1
+      served: true
+      referenceable: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - parameters
+              properties:
+                parameters:
+                  type: object
+                  required:
+                    - region
+                    - awsAccountId
+                    - buId
+                    - env
+                    - friendlyName
+                    - vpcCidr
+                    - azs
+                    - eksNodeSubnetCidrs
+                    - resourceSubnetCidrs
+                    - publicSubnetCidrs
+                  properties:
+                    buId:
+                      type: string
+                      description: Business Unit identifier — must match an EnvironmentConfig with label bu-id
+                      pattern: "^BU[0-9]{3}$"
+                    awsAccountId:
+                      type: string
+                      description: AWS account ID where the VPC will be created
+                      pattern: "^[0-9]{12}$"
+                    region:
+                      type: string
+                      description: AWS region (e.g. us-east-1)
+                    env:
+                      type: string
+                      description: Environment name
+                      enum: [dev, staging, prod]
+                    friendlyName:
+                      type: string
+                      description: Short name prefix used in resource naming (e.g. bu001-dev)
+                    vpcCidr:
+                      type: string
+                      description: CIDR block for the VPC (e.g. 10.0.0.0/16)
+                    azs:
+                      type: array
+                      minItems: 2
+                      maxItems: 3
+                      items:
+                        type: string
+                      description: >-
+                        Availability zones — 2 or 3. Must match the length of each
+                        subnet CIDR array (eksNodeSubnetCidrs, resourceSubnetCidrs,
+                        publicSubnetCidrs).
+                    eksNodeSubnetCidrs:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Private subnet CIDRs for EKS nodes, one per AZ.
+                        These subnets have a NAT GW route for image pulls.
+                        Example for 10.0.0.0/16 with 3 AZs:
+                        [10.0.0.0/19, 10.0.32.0/19, 10.0.64.0/19]
+                    resourceSubnetCidrs:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Private subnet CIDRs for AWS managed resources (RDS,
+                        ElastiCache, etc.), one per AZ. No NAT GW route.
+                        Example: [10.0.96.0/19, 10.0.128.0/19, 10.0.160.0/19]
+                    publicSubnetCidrs:
+                      type: array
+                      items:
+                        type: string
+                      description: >-
+                        Public subnet CIDRs for load balancers, one per AZ.
+                        Example: [10.0.192.0/24, 10.0.193.0/24, 10.0.194.0/24]
+                    singleNatGateway:
+                      type: boolean
+                      default: false
+                      description: >-
+                        Use a single NAT Gateway instead of one per AZ.
+                        Reduces cost but removes AZ fault tolerance. Recommended
+                        for dev environments only.
+                    enableFlowLogs:
+                      type: boolean
+                      default: false
+                      description: Enable VPC flow logs to CloudWatch Logs.
+                    flowLogsRetentionDays:
+                      type: integer
+                      default: 7
+                      description: CloudWatch Logs retention period for flow logs (days).
+                    enableVpcEndpoints:
+                      type: boolean
+                      default: true
+                      description: >-
+                        Create VPC endpoints for SSM, SSMMessages, EC2Messages,
+                        KMS, ECR API, ECR DKR, EC2, STS, logs (interface) and
+                        S3, DynamoDB (gateway). Required for private EKS clusters
+                        to pull images without NAT GW.
+                    tags:
+                      type: object
+                      additionalProperties:
+                        type: string
+                      description: Additional tags applied to all resources.
+            status:
+              type: object
+              properties:
+                vpcId:
+                  type: string
+                  description: The provisioned VPC ID. Provide this as vpcId in UEks claims.
+                eksNodeSubnetIds:
+                  type: array
+                  items:
+                    type: string
+                  description: Subnet IDs for EKS node placement. Provide this as subnetIds in UEks claims.
+                resourceSubnetIds:
+                  type: array
+                  items:
+                    type: string
+                  description: Subnet IDs for AWS managed resources (RDS, ElastiCache, etc.)
+                publicSubnetIds:
+                  type: array
+                  items:
+                    type: string
+                  description: Subnet IDs for public load balancers.
+                nodeSecurityGroupId:
+                  type: string
+                  description: Security group ID for EKS nodes. Provide this as nodeSecurityGroupId in UEks claims.
+                controlPlaneSecurityGroupId:
+                  type: string
+                  description: Security group ID for EKS control plane. Provide this as controlPlaneSecurityGroupId in UEks claims.
+                resourcesSecurityGroupId:
+                  type: string
+                  description: Security group ID for AWS managed resources (RDS, ElastiCache, etc.)

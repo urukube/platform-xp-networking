@@ -1,0 +1,1062 @@
+---
+apiVersion: apiextensions.crossplane.io/v1
+kind: Composition
+metadata:
+  name: xuvpcs.networking.platform.urukube.io
+  labels:
+    provider: aws
+spec:
+  compositeTypeRef:
+    apiVersion: networking.platform.urukube.io/v1alpha1
+    kind: XUVpc
+  mode: Pipeline
+  pipeline:
+    # -------------------------------------------------------------------------
+    # Step 1 — Resolve EnvironmentConfigs into the pipeline context.
+    # Merges org-defaults (static) with the BU-specific config.
+    # -------------------------------------------------------------------------
+    - step: resolve-environment
+      functionRef:
+        name: function-environment-configs
+      input:
+        apiVersion: environmentconfigs.fn.crossplane.io/v1beta1
+        kind: Input
+        spec:
+          environmentConfigs:
+            - type: Reference
+              ref:
+                name: org-defaults
+            - type: Selector
+              selector:
+                matchLabels:
+                  - key: bu-id
+                    type: FromCompositeFieldPath
+                    valueFromFieldPath: spec.parameters.buId
+
+    # -------------------------------------------------------------------------
+    # Step 2 — ProviderConfig (static, one per composite).
+    # Chains the orchestrator IRSA role into the target account.
+    # -------------------------------------------------------------------------
+    - step: patch-and-transform
+      functionRef:
+        name: function-patch-and-transform
+      input:
+        apiVersion: pt.fn.crossplane.io/v1beta1
+        kind: Resources
+        resources:
+          - name: provider-config
+            base:
+              apiVersion: aws.upbound.io/v1beta1
+              kind: ProviderConfig
+              spec:
+                credentials:
+                  source: IRSA
+                assumeRoleChain:
+                  - roleARN: placeholder
+            patches:
+              - type: FromCompositeFieldPath
+                fromFieldPath: metadata.name
+                toFieldPath: metadata.name
+              - type: FromCompositeFieldPath
+                fromFieldPath: spec.parameters.awsAccountId
+                toFieldPath: spec.assumeRoleChain[0].roleARN
+                transforms:
+                  - type: string
+                    string:
+                      type: Format
+                      fmt: "arn:aws:iam::%s:role/urukube-crossplane-role"
+            readinessChecks:
+              - type: None
+
+    # -------------------------------------------------------------------------
+    # Step 3 — Generate all VPC resources dynamically via go-templating.
+    # Resources created:
+    #   - VPC, InternetGateway
+    #   - N EKS node subnets, N resource subnets, N public subnets (one per AZ)
+    #   - N EIPs + N NAT Gateways (or 1 if singleNatGateway)
+    #   - Public route table + IGW route + N associations
+    #   - Private route table(s) + NAT GW route(s) + N associations
+    #   - Intra route table + N associations
+    #   - Security Groups: eks-nodes, eks-control-plane, aws-resources,
+    #     vpc-endpoints (conditional)
+    #   - All security group ingress/egress rules
+    #   - VPC interface + gateway endpoints (conditional on enableVpcEndpoints)
+    # Status fields written back to the composite resource after each reconcile.
+    # -------------------------------------------------------------------------
+    - step: generate-resources
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params  := .observed.composite.resource.spec.parameters }}
+            {{- $name    := .observed.composite.resource.metadata.name }}
+            {{- $obs     := .observed.resources }}
+            {{- $clsName := printf "%s-eks" $params.friendlyName }}
+            {{- $pcRef   := $name }}
+
+            {{- /* ----------------------------------------------------------------
+                 Helpers
+                 ---------------------------------------------------------------- */}}
+            {{- $commonTags := dict
+                  "env"    $params.env
+                  "bu_id"  $params.buId
+            }}
+
+            {{- /* Interface endpoint service names */}}
+            {{- $ifaceEndpoints := list "ssm" "ssmmessages" "ec2messages" "kms" "ecr.api" "ecr.dkr" "ec2" "sts" "logs" }}
+            {{- $gwEndpoints    := list "s3" "dynamodb" }}
+
+            {{- /* ----------------------------------------------------------------
+                 VPC
+                 ---------------------------------------------------------------- */}}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: VPC
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: vpc
+              labels:
+                resource: vpc
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                cidrBlock: {{ $params.vpcCidr }}
+                enableDnsHostnames: true
+                enableDnsSupport: true
+                tags:
+                  Name: {{ printf "%s-vpc" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- /* ----------------------------------------------------------------
+                 Internet Gateway — vpcIdSelector picks the VPC above by label
+                 ---------------------------------------------------------------- */}}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: InternetGateway
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: igw
+              labels:
+                resource: igw
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-igw" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- /* ----------------------------------------------------------------
+                 Subnets — one per AZ per tier
+                 ---------------------------------------------------------------- */}}
+            {{- range $i, $az := $params.azs }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Subnet
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-eks-%d" $i }}
+              labels:
+                tier: eks-nodes
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                availabilityZone: {{ $az }}
+                cidrBlock: {{ index $params.eksNodeSubnetCidrs $i }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                mapPublicIpOnLaunch: false
+                tags:
+                  Name: {{ printf "%s-eks-nodes-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+                  kubernetes.io/role/internal-elb: "1"
+                  {{ printf "kubernetes.io/cluster/%s" $clsName }}: shared
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Subnet
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-res-%d" $i }}
+              labels:
+                tier: resources
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                availabilityZone: {{ $az }}
+                cidrBlock: {{ index $params.resourceSubnetCidrs $i }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                mapPublicIpOnLaunch: false
+                tags:
+                  Name: {{ printf "%s-resources-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+                  Tier: resources
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Subnet
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-pub-%d" $i }}
+              labels:
+                tier: public
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                availabilityZone: {{ $az }}
+                cidrBlock: {{ index $params.publicSubnetCidrs $i }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                mapPublicIpOnLaunch: false
+                tags:
+                  Name: {{ printf "%s-public-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+                  kubernetes.io/role/elb: "1"
+                  {{ printf "kubernetes.io/cluster/%s" $clsName }}: shared
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- end }}{{/* end range azs */}}
+
+            {{- /* ----------------------------------------------------------------
+                 EIPs and NAT Gateways
+                 singleNatGateway=true  → 1 EIP + 1 NAT GW in AZ[0]'s public subnet
+                 singleNatGateway=false → 1 EIP + 1 NAT GW per AZ
+                 ---------------------------------------------------------------- */}}
+            {{- $natAzs := $params.azs }}
+            {{- if $params.singleNatGateway }}{{- $natAzs = slice $params.azs 0 1 }}{{- end }}
+
+            {{- range $i, $az := $natAzs }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: EIP
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "eip-%d" $i }}
+              labels:
+                resource: eip
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                domain: vpc
+                tags:
+                  Name: {{ printf "%s-natgw-eip-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: NATGateway
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "natgw-%d" $i }}
+              labels:
+                resource: natgw
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                connectivityType: public
+                allocationIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: eip
+                    az-index: {{ printf "%d" $i | quote }}
+                subnetIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    tier: public
+                    az-index: {{ printf "%d" $i | quote }}
+                tags:
+                  Name: {{ printf "%s-natgw-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}{{/* end range natAzs */}}
+
+            {{- /* ----------------------------------------------------------------
+                 Route Tables + Routes + Associations
+                 ---------------------------------------------------------------- */}}
+
+            {{- /* Public route table — shared across all public subnets */}}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTable
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: rt-public
+              labels:
+                rt-tier: public
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-rt-public" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Route
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: route-public-igw
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: public
+                destinationCidrBlock: "0.0.0.0/0"
+                gatewayIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: igw
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- range $i, $az := $params.azs }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTableAssociation
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-pub-%d" $i }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: public
+                subnetIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    tier: public
+                    az-index: {{ printf "%d" $i | quote }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}
+
+            {{- /* Private route tables for EKS node subnets.
+                 singleNatGateway=true  → 1 shared table + 1 route pointing to natgw-0
+                 singleNatGateway=false → 1 table per AZ pointing to its own natgw */}}
+            {{- if $params.singleNatGateway }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTable
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: rt-private-0
+              labels:
+                rt-tier: private
+                az-index: "0"
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-rt-private" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Route
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: route-private-natgw-0
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: private
+                    az-index: "0"
+                destinationCidrBlock: "0.0.0.0/0"
+                natGatewayIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: natgw
+                    az-index: "0"
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- range $i, $az := $params.azs }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTableAssociation
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-priv-%d" $i }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: private
+                    az-index: "0"
+                subnetIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    tier: eks-nodes
+                    az-index: {{ printf "%d" $i | quote }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}
+
+            {{- else }}{{/* multi NAT GW — one RT per AZ */}}
+            {{- range $i, $az := $params.azs }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTable
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rt-private-%d" $i }}
+              labels:
+                rt-tier: private
+                az-index: {{ printf "%d" $i | quote }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-rt-private-%s" $params.friendlyName $az }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: Route
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "route-private-natgw-%d" $i }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: private
+                    az-index: {{ printf "%d" $i | quote }}
+                destinationCidrBlock: "0.0.0.0/0"
+                natGatewayIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: natgw
+                    az-index: {{ printf "%d" $i | quote }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTableAssociation
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-priv-%d" $i }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: private
+                    az-index: {{ printf "%d" $i | quote }}
+                subnetIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    tier: eks-nodes
+                    az-index: {{ printf "%d" $i | quote }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}{{/* end range azs (multi NAT) */}}
+            {{- end }}{{/* end singleNatGateway if/else */}}
+
+            {{- /* Intra (resource) route table — no internet route */}}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTable
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: rt-intra
+              labels:
+                rt-tier: intra
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-rt-intra" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- range $i, $az := $params.azs }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: RouteTableAssociation
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-intra-%d" $i }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                routeTableIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    rt-tier: intra
+                subnetIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    tier: resources
+                    az-index: {{ printf "%d" $i | quote }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}
+
+            {{- /* ----------------------------------------------------------------
+                 Security Groups
+                 ---------------------------------------------------------------- */}}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroup
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sg-eks-nodes
+              labels:
+                sg-for: eks-nodes
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                description: Security group for EKS worker nodes
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-eks-nodes-sg" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupIngressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-nodes-vpc-ingress
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                cidrIpv4: {{ $params.vpcCidr }}
+                ipProtocol: "-1"
+                description: Allow all traffic from VPC CIDR
+                tags:
+                  Name: {{ printf "%s-nodes-vpc-ingress" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupEgressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-nodes-egress
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                cidrIpv4: "0.0.0.0/0"
+                ipProtocol: "-1"
+                description: Allow all outbound traffic
+                tags:
+                  Name: {{ printf "%s-nodes-egress" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroup
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sg-eks-control-plane
+              labels:
+                sg-for: eks-control-plane
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                description: Security group for EKS control plane
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-eks-control-plane-sg" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupIngressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-from-nodes-https
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-control-plane
+                referencedSecurityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                fromPort: 443
+                toPort: 443
+                ipProtocol: tcp
+                description: Allow HTTPS from worker nodes
+                tags:
+                  Name: {{ printf "%s-cp-from-nodes-https" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupEgressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-to-nodes-https
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-control-plane
+                referencedSecurityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                fromPort: 443
+                toPort: 443
+                ipProtocol: tcp
+                description: Allow HTTPS to worker nodes
+                tags:
+                  Name: {{ printf "%s-cp-to-nodes-https" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupEgressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-to-nodes-kubelet
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-control-plane
+                referencedSecurityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                fromPort: 1025
+                toPort: 65535
+                ipProtocol: tcp
+                description: Allow kubelet and extension API traffic to worker nodes
+                tags:
+                  Name: {{ printf "%s-cp-to-nodes-kubelet" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroup
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sg-aws-resources
+              labels:
+                sg-for: aws-resources
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                description: Security group for AWS managed resources (RDS, ElastiCache, etc.)
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-resources-sg" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupIngressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-resources-from-nodes
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: aws-resources
+                referencedSecurityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: eks-nodes
+                ipProtocol: "-1"
+                description: Allow all traffic from EKS nodes
+                tags:
+                  Name: {{ printf "%s-resources-from-nodes" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupEgressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-resources-egress
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: aws-resources
+                cidrIpv4: {{ $params.vpcCidr }}
+                ipProtocol: "-1"
+                description: Allow all outbound traffic within VPC
+                tags:
+                  Name: {{ printf "%s-resources-egress" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- /* ----------------------------------------------------------------
+                 VPC Endpoints (conditional on enableVpcEndpoints)
+                 ---------------------------------------------------------------- */}}
+            {{- if $params.enableVpcEndpoints }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroup
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sg-vpc-endpoints
+              labels:
+                sg-for: vpc-endpoints
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                description: Security group for VPC endpoints
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                tags:
+                  Name: {{ printf "%s-vpc-endpoints-sg" $params.friendlyName }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupIngressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-endpoints-https
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: vpc-endpoints
+                cidrIpv4: {{ $params.vpcCidr }}
+                fromPort: 443
+                toPort: 443
+                ipProtocol: tcp
+                description: Allow HTTPS from VPC CIDR
+                tags:
+                  Name: {{ printf "%s-endpoints-https" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: SecurityGroupEgressRule
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: sgr-endpoints-egress
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: vpc-endpoints
+                cidrIpv4: "0.0.0.0/0"
+                ipProtocol: "-1"
+                description: Allow all outbound traffic
+                tags:
+                  Name: {{ printf "%s-endpoints-egress" $params.friendlyName }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+
+            {{- /* Collect EKS node subnet IDs from observed state for endpoint placement */}}
+            {{- $eksSubnetIds := list }}
+            {{- range $i, $az := $params.azs }}
+            {{- $subnetKey := printf "subnet-eks-%d" $i }}
+            {{- if index $obs $subnetKey }}
+            {{- $id := (index $obs $subnetKey).resource.status.atProvider.id }}
+            {{- if $id }}{{- $eksSubnetIds = append $eksSubnetIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- /* Collect private + intra route table IDs for gateway endpoints */}}
+            {{- $rtIds := list }}
+            {{- range $i, $az := $params.azs }}
+            {{- $rtKey := printf "rt-private-%d" $i }}
+            {{- if index $obs $rtKey }}
+            {{- $id := (index $obs $rtKey).resource.status.atProvider.id }}
+            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if $params.singleNatGateway }}
+            {{- if index $obs "rt-private-0" }}
+            {{- $id := (index $obs "rt-private-0").resource.status.atProvider.id }}
+            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+            {{- if index $obs "rt-intra" }}
+            {{- $id := (index $obs "rt-intra").resource.status.atProvider.id }}
+            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
+            {{- end }}
+            {{- if index $obs "rt-public" }}
+            {{- $id := (index $obs "rt-public").resource.status.atProvider.id }}
+            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
+            {{- end }}
+
+            {{- /* Interface endpoints */}}
+            {{- range $svc := $ifaceEndpoints }}
+            {{- $safeKey := $svc | replace "." "-" }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: VPCEndpoint
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-iface-%s" $safeKey }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcEndpointType: Interface
+                serviceName: {{ printf "com.amazonaws.%s.%s" $params.region $svc }}
+                privateDnsEnabled: true
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                securityGroupIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    sg-for: vpc-endpoints
+                {{- if $eksSubnetIds }}
+                subnetIds:
+                  {{- range $eksSubnetIds }}
+                  - {{ . }}
+                  {{- end }}
+                {{- end }}
+                tags:
+                  Name: {{ printf "%s-%s-endpoint" $params.friendlyName $safeKey }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}{{/* end range ifaceEndpoints */}}
+
+            {{- /* Gateway endpoints */}}
+            {{- range $svc := $gwEndpoints }}
+            ---
+            apiVersion: ec2.aws.upbound.io/v1beta1
+            kind: VPCEndpoint
+            metadata:
+              annotations:
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-gw-%s" $svc }}
+            spec:
+              forProvider:
+                region: {{ $params.region }}
+                vpcEndpointType: Gateway
+                serviceName: {{ printf "com.amazonaws.%s.%s" $params.region $svc }}
+                vpcIdSelector:
+                  matchControllerRef: true
+                  matchLabels:
+                    resource: vpc
+                {{- if $rtIds }}
+                routeTableIds:
+                  {{- range $rtIds }}
+                  - {{ . }}
+                  {{- end }}
+                {{- end }}
+                tags:
+                  Name: {{ printf "%s-%s-endpoint" $params.friendlyName $svc }}
+                  env: {{ $params.env }}
+                  bu_id: {{ $params.buId }}
+              providerConfigRef:
+                name: {{ $pcRef }}
+            {{- end }}{{/* end range gwEndpoints */}}
+
+            {{- end }}{{/* end if enableVpcEndpoints */}}
+
+            {{- /* ----------------------------------------------------------------
+                 Write status back to the composite resource.
+                 IDs are read from .observed.resources (available from 2nd reconcile).
+                 ---------------------------------------------------------------- */}}
+            {{- $vpcId    := "" }}
+            {{- $nodesSgId := "" }}
+            {{- $cpSgId   := "" }}
+            {{- $resSgId  := "" }}
+            {{- if index $obs "vpc" }}{{- $vpcId = (index $obs "vpc").resource.status.atProvider.id }}{{- end }}
+            {{- if index $obs "sg-eks-nodes" }}{{- $nodesSgId = (index $obs "sg-eks-nodes").resource.status.atProvider.id }}{{- end }}
+            {{- if index $obs "sg-eks-control-plane" }}{{- $cpSgId = (index $obs "sg-eks-control-plane").resource.status.atProvider.id }}{{- end }}
+            {{- if index $obs "sg-aws-resources" }}{{- $resSgId = (index $obs "sg-aws-resources").resource.status.atProvider.id }}{{- end }}
+
+            {{- $eksSubnetStatusIds := list }}
+            {{- range $i, $az := $params.azs }}
+            {{- $key := printf "subnet-eks-%d" $i }}
+            {{- if index $obs $key }}
+            {{- $id := (index $obs $key).resource.status.atProvider.id }}
+            {{- if $id }}{{- $eksSubnetStatusIds = append $eksSubnetStatusIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- $resSubnetStatusIds := list }}
+            {{- range $i, $az := $params.azs }}
+            {{- $key := printf "subnet-res-%d" $i }}
+            {{- if index $obs $key }}
+            {{- $id := (index $obs $key).resource.status.atProvider.id }}
+            {{- if $id }}{{- $resSubnetStatusIds = append $resSubnetStatusIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- $pubSubnetStatusIds := list }}
+            {{- range $i, $az := $params.azs }}
+            {{- $key := printf "subnet-pub-%d" $i }}
+            {{- if index $obs $key }}
+            {{- $id := (index $obs $key).resource.status.atProvider.id }}
+            {{- if $id }}{{- $pubSubnetStatusIds = append $pubSubnetStatusIds $id }}{{- end }}
+            {{- end }}
+            {{- end }}
+
+            ---
+            apiVersion: networking.platform.urukube.io/v1alpha1
+            kind: XUVpc
+            metadata:
+              name: {{ $name }}
+            status:
+              vpcId: {{ $vpcId | quote }}
+              nodeSecurityGroupId: {{ $nodesSgId | quote }}
+              controlPlaneSecurityGroupId: {{ $cpSgId | quote }}
+              resourcesSecurityGroupId: {{ $resSgId | quote }}
+              eksNodeSubnetIds:
+                {{- if $eksSubnetStatusIds }}
+                {{- range $eksSubnetStatusIds }}
+                - {{ . | quote }}
+                {{- end }}
+                {{- else }}
+                []
+                {{- end }}
+              resourceSubnetIds:
+                {{- if $resSubnetStatusIds }}
+                {{- range $resSubnetStatusIds }}
+                - {{ . | quote }}
+                {{- end }}
+                {{- else }}
+                []
+                {{- end }}
+              publicSubnetIds:
+                {{- if $pubSubnetStatusIds }}
+                {{- range $pubSubnetStatusIds }}
+                - {{ . | quote }}
+                {{- end }}
+                {{- else }}
+                []
+                {{- end }}
