@@ -106,6 +106,18 @@ spec:
                   "bu_id"  $params.buId
             }}
 
+            {{- /* Build a readiness map: composition-resource-name -> "True" if Ready=True in observed.
+                 function-go-templating does not auto-propagate readiness; we must set the
+                 gotemplating.fn.crossplane.io/ready annotation explicitly on each resource. */}}
+            {{- $readyMap := dict }}
+            {{- range $crn, $res := $obs }}
+            {{- range $res.resource.status.conditions }}
+            {{- if and (eq .type "Ready") (eq .status "True") }}
+            {{- $readyMap = merge $readyMap (dict $crn "True") }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
             {{- /* Interface endpoint service names */}}
             {{- $ifaceEndpoints := list "ssm" "ssmmessages" "ec2messages" "kms" "ecr.api" "ecr.dkr" "ec2" "sts" "logs" }}
             {{- $gwEndpoints    := list "s3" "dynamodb" }}
@@ -119,6 +131,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: vpc
+                {{- if index $readyMap "vpc" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 resource: vpc
             spec:
@@ -143,6 +158,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: igw
+                {{- if index $readyMap "igw" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 resource: igw
             spec:
@@ -170,6 +188,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-eks-%d" $i }}
+                {{- if index $readyMap (printf "subnet-eks-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 tier: eks-nodes
                 az-index: {{ printf "%d" $i | quote }}
@@ -198,6 +219,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-res-%d" $i }}
+                {{- if index $readyMap (printf "subnet-res-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 tier: resources
                 az-index: {{ printf "%d" $i | quote }}
@@ -225,6 +249,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "subnet-pub-%d" $i }}
+                {{- if index $readyMap (printf "subnet-pub-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 tier: public
                 az-index: {{ printf "%d" $i | quote }}
@@ -264,6 +291,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "eip-%d" $i }}
+                {{- if index $readyMap (printf "eip-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 resource: eip
                 az-index: {{ printf "%d" $i | quote }}
@@ -284,6 +314,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "natgw-%d" $i }}
+                {{- if index $readyMap (printf "natgw-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 resource: natgw
                 az-index: {{ printf "%d" $i | quote }}
@@ -320,6 +353,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: rt-public
+                {{- if index $readyMap "rt-public" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 rt-tier: public
             spec:
@@ -342,6 +378,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: route-public-igw
+                {{- if index $readyMap "route-public-igw" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -364,6 +403,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-pub-%d" $i }}
+                {{- if index $readyMap (printf "rta-pub-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -390,6 +432,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: rt-private-0
+                {{- if index $readyMap "rt-private-0" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 rt-tier: private
                 az-index: "0"
@@ -413,6 +458,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: route-private-natgw-0
+                {{- if index $readyMap "route-private-natgw-0" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -437,6 +485,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-priv-%d" $i }}
+                {{- if index $readyMap (printf "rta-priv-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -462,6 +513,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rt-private-%d" $i }}
+                {{- if index $readyMap (printf "rt-private-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 rt-tier: private
                 az-index: {{ printf "%d" $i | quote }}
@@ -485,6 +539,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "route-private-natgw-%d" $i }}
+                {{- if index $readyMap (printf "route-private-natgw-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -508,6 +565,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-priv-%d" $i }}
+                {{- if index $readyMap (printf "rta-priv-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -533,6 +593,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: rt-intra
+                {{- if index $readyMap "rt-intra" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 rt-tier: intra
             spec:
@@ -556,6 +619,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "rta-intra-%d" $i }}
+                {{- if index $readyMap (printf "rta-intra-%d" $i) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -582,6 +648,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sg-eks-nodes
+                {{- if index $readyMap "sg-eks-nodes" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 sg-for: eks-nodes
             spec:
@@ -605,6 +674,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-nodes-vpc-ingress
+                {{- if index $readyMap "sgr-nodes-vpc-ingress" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -626,6 +698,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-nodes-egress
+                {{- if index $readyMap "sgr-nodes-egress" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -647,6 +722,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sg-eks-control-plane
+                {{- if index $readyMap "sg-eks-control-plane" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 sg-for: eks-control-plane
             spec:
@@ -670,6 +748,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-from-nodes-https
+                {{- if index $readyMap "sgr-cp-from-nodes-https" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -696,6 +777,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-to-nodes-https
+                {{- if index $readyMap "sgr-cp-to-nodes-https" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -722,6 +806,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-cp-to-nodes-kubelet
+                {{- if index $readyMap "sgr-cp-to-nodes-kubelet" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -748,6 +835,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sg-aws-resources
+                {{- if index $readyMap "sg-aws-resources" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 sg-for: aws-resources
             spec:
@@ -771,6 +861,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-resources-from-nodes
+                {{- if index $readyMap "sgr-resources-from-nodes" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -795,6 +888,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-resources-egress
+                {{- if index $readyMap "sgr-resources-egress" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -821,6 +917,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sg-vpc-endpoints
+                {{- if index $readyMap "sg-vpc-endpoints" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
               labels:
                 sg-for: vpc-endpoints
             spec:
@@ -844,6 +943,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-endpoints-https
+                {{- if index $readyMap "sgr-endpoints-https" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -867,6 +969,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: sgr-endpoints-egress
+                {{- if index $readyMap "sgr-endpoints-egress" }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -925,6 +1030,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-iface-%s" $safeKey }}
+                {{- if index $readyMap (printf "vpce-iface-%s" $safeKey) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
@@ -951,6 +1059,9 @@ spec:
             metadata:
               annotations:
                 gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-gw-%s" $svc }}
+                {{- if index $readyMap (printf "vpce-gw-%s" $svc) }}
+                gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
             spec:
               forProvider:
                 region: {{ $params.region }}
