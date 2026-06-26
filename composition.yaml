@@ -935,12 +935,6 @@ spec:
                   matchControllerRef: true
                   matchLabels:
                     resource: vpc
-                {{- if $eksSubnetIds }}
-                subnetIds:
-                  {{- range $eksSubnetIds }}
-                  - {{ . }}
-                  {{- end }}
-                {{- end }}
                 tags:
                   Name: {{ printf "%s-%s-endpoint" $params.friendlyName $safeKey }}
                   env: {{ $params.env }}
