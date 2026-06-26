@@ -2,13 +2,13 @@
 apiVersion: apiextensions.crossplane.io/v1
 kind: Composition
 metadata:
-  name: xuvpcs.networking.platform.urukube.io
+  name: xunetworks.networking.platform.urukube.io
   labels:
     provider: aws
 spec:
   compositeTypeRef:
     apiVersion: networking.platform.urukube.io/v1alpha1
-    kind: XUVpc
+    kind: XUNetwork
   mode: Pipeline
   pipeline:
     # -------------------------------------------------------------------------
@@ -1028,7 +1028,7 @@ spec:
 
             ---
             apiVersion: networking.platform.urukube.io/v1alpha1
-            kind: XUVpc
+            kind: XUNetwork
             metadata:
               name: {{ $name }}
             status:

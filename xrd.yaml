@@ -2,15 +2,15 @@
 apiVersion: apiextensions.crossplane.io/v1
 kind: CompositeResourceDefinition
 metadata:
-  name: xuvpcs.networking.platform.urukube.io
+  name: xunetworks.networking.platform.urukube.io
 spec:
   group: networking.platform.urukube.io
   names:
-    kind: XUVpc
-    plural: xuvpcs
+    kind: XUNetwork
+    plural: xunetworks
   claimNames:
-    kind: UVpc
-    plural: uvpcs
+    kind: UNetwork
+    plural: unetworks
   versions:
     - name: v1alpha1
       served: true
