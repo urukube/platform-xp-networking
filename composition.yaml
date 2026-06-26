@@ -94,7 +94,7 @@ spec:
           template: |
             {{- $params  := .observed.composite.resource.spec.parameters }}
             {{- $name    := .observed.composite.resource.metadata.name }}
-            {{- $obs     := .observed.resources }}
+            {{- $obs     := default (dict) .observed.resources }}
             {{- $clsName := printf "%s-eks" $params.friendlyName }}
             {{- $pcRef   := $name }}
 
