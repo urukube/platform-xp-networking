@@ -960,12 +960,6 @@ spec:
                   matchControllerRef: true
                   matchLabels:
                     resource: vpc
-                {{- if $rtIds }}
-                routeTableIds:
-                  {{- range $rtIds }}
-                  - {{ . }}
-                  {{- end }}
-                {{- end }}
                 tags:
                   Name: {{ printf "%s-%s-endpoint" $params.friendlyName $svc }}
                   env: {{ $params.env }}
