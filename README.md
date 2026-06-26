@@ -2,6 +2,10 @@
 
 Crossplane XRD package that provides a self-service VPC networking golden path for the `urukube` platform. ArgoCD auto-discovers this repo via the `platform-custom-xrds` GitHub topic and deploys it to `crossplane-system` on the orchestrator cluster.
 
+## Composition pipeline
+
+![Composition flowchart](assets/composition-flowchart.svg)
+
 ## What gets provisioned
 
 Every `UNetwork` claim creates the following AWS resources in the target account:
