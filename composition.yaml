@@ -118,6 +118,61 @@ spec:
             {{- end }}
             {{- end }}
 
+            {{- /* ----------------------------------------------------------------
+                 CIDR auto-computation — mirrors terraform-module-networking/locals.tf.
+                 If the caller omits subnet CIDR arrays, compute them from vpcCidr:
+                   EKS nodes:  cidrsubnet(vpcCidr, 3, idx)           → /19 at offset 0..N-1
+                   Resources:  cidrsubnet(vpcCidr, 3, numAzs + idx)  → /19 after EKS
+                   Public:     cidrsubnet(vpcCidr, 8, 192 + idx)     → /24 at offset 192+
+                 Powers-of-2 lookup avoids needing a 'pow' function (index = exponent).
+                 ---------------------------------------------------------------- */}}
+            {{- $cidrParts := splitList "/" $params.vpcCidr }}
+            {{- $vpcPrefix := last $cidrParts | int }}
+            {{- $ipOctets  := splitList "." (first $cidrParts) }}
+            {{- $o0 := index $ipOctets 0 | int }}
+            {{- $o1 := index $ipOctets 1 | int }}
+            {{- $o2 := index $ipOctets 2 | int }}
+            {{- $o3 := index $ipOctets 3 | int }}
+            {{- $baseIp := add (mul $o0 16777216) (mul $o1 65536) (mul $o2 256) $o3 }}
+            {{- $pow2 := list 1 2 4 8 16 32 64 128 256 512 1024 2048 4096 8192 16384 32768 65536 131072 262144 524288 1048576 2097152 4194304 8388608 16777216 }}
+            {{- $numAzs := len $params.azs }}
+
+            {{- $eksSubnetCidrs := list }}
+            {{- if $params.eksNodeSubnetCidrs }}
+            {{- $eksSubnetCidrs = $params.eksNodeSubnetCidrs }}
+            {{- else }}
+            {{- $eksPrefix := add $vpcPrefix 3 }}
+            {{- $eksBlock  := index $pow2 (sub 32 $eksPrefix) }}
+            {{- range $i, $az := $params.azs }}
+            {{- $s := add $baseIp (mul $eksBlock $i) }}
+            {{- $eksSubnetCidrs = append $eksSubnetCidrs (printf "%d.%d.%d.%d/%d" (div $s 16777216) (div (mod $s 16777216) 65536) (div (mod $s 65536) 256) (mod $s 256) $eksPrefix) }}
+            {{- end }}
+            {{- end }}
+
+            {{- $resSubnetCidrs := list }}
+            {{- if $params.resourceSubnetCidrs }}
+            {{- $resSubnetCidrs = $params.resourceSubnetCidrs }}
+            {{- else }}
+            {{- $resPrefix := add $vpcPrefix 3 }}
+            {{- $resBlock  := index $pow2 (sub 32 $resPrefix) }}
+            {{- range $i, $az := $params.azs }}
+            {{- $s := add $baseIp (mul $resBlock (add $numAzs $i)) }}
+            {{- $resSubnetCidrs = append $resSubnetCidrs (printf "%d.%d.%d.%d/%d" (div $s 16777216) (div (mod $s 16777216) 65536) (div (mod $s 65536) 256) (mod $s 256) $resPrefix) }}
+            {{- end }}
+            {{- end }}
+
+            {{- $pubSubnetCidrs := list }}
+            {{- if $params.publicSubnetCidrs }}
+            {{- $pubSubnetCidrs = $params.publicSubnetCidrs }}
+            {{- else }}
+            {{- $pubPrefix := add $vpcPrefix 8 }}
+            {{- $pubBlock  := index $pow2 (sub 32 $pubPrefix) }}
+            {{- range $i, $az := $params.azs }}
+            {{- $s := add $baseIp (mul $pubBlock (add 192 $i)) }}
+            {{- $pubSubnetCidrs = append $pubSubnetCidrs (printf "%d.%d.%d.%d/%d" (div $s 16777216) (div (mod $s 16777216) 65536) (div (mod $s 65536) 256) (mod $s 256) $pubPrefix) }}
+            {{- end }}
+            {{- end }}
+
             {{- /* Interface endpoint service names */}}
             {{- $ifaceEndpoints := list "ssm" "ssmmessages" "ec2messages" "kms" "ecr.api" "ecr.dkr" "ec2" "sts" "logs" }}
             {{- $gwEndpoints    := list "s3" "dynamodb" }}
@@ -198,7 +253,7 @@ spec:
               forProvider:
                 region: {{ $params.region }}
                 availabilityZone: {{ $az }}
-                cidrBlock: {{ index $params.eksNodeSubnetCidrs $i }}
+                cidrBlock: {{ index $eksSubnetCidrs $i }}
                 vpcIdSelector:
                   matchControllerRef: true
                   matchLabels:
@@ -229,7 +284,7 @@ spec:
               forProvider:
                 region: {{ $params.region }}
                 availabilityZone: {{ $az }}
-                cidrBlock: {{ index $params.resourceSubnetCidrs $i }}
+                cidrBlock: {{ index $resSubnetCidrs $i }}
                 vpcIdSelector:
                   matchControllerRef: true
                   matchLabels:
@@ -259,7 +314,7 @@ spec:
               forProvider:
                 region: {{ $params.region }}
                 availabilityZone: {{ $az }}
-                cidrBlock: {{ index $params.publicSubnetCidrs $i }}
+                cidrBlock: {{ index $pubSubnetCidrs $i }}
                 vpcIdSelector:
                   matchControllerRef: true
                   matchLabels:

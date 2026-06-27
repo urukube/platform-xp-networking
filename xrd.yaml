@@ -34,9 +34,6 @@ spec:
                     - friendlyName
                     - vpcCidr
                     - azs
-                    - eksNodeSubnetCidrs
-                    - resourceSubnetCidrs
-                    - publicSubnetCidrs
                   properties:
                     buId:
                       type: string
@@ -74,25 +71,29 @@ spec:
                       items:
                         type: string
                       description: >-
-                        Private subnet CIDRs for EKS nodes, one per AZ.
-                        These subnets have a NAT GW route for image pulls.
-                        Example for 10.0.0.0/16 with 3 AZs:
-                        [10.0.0.0/19, 10.0.32.0/19, 10.0.64.0/19]
+                        Optional. Private subnet CIDRs for EKS nodes, one per AZ.
+                        Auto-computed from vpcCidr if omitted: cidrsubnet(vpcCidr, 3, idx)
+                        producing one /19 per AZ starting at offset 0.
+                        Example for 10.0.0.0/16 with 2 AZs: [10.0.0.0/19, 10.0.32.0/19]
                     resourceSubnetCidrs:
                       type: array
                       items:
                         type: string
                       description: >-
-                        Private subnet CIDRs for AWS managed resources (RDS,
+                        Optional. Private subnet CIDRs for AWS managed resources (RDS,
                         ElastiCache, etc.), one per AZ. No NAT GW route.
-                        Example: [10.0.96.0/19, 10.0.128.0/19, 10.0.160.0/19]
+                        Auto-computed from vpcCidr if omitted: cidrsubnet(vpcCidr, 3, numAzs+idx)
+                        continuing immediately after the EKS node subnets.
+                        Example for 10.0.0.0/16 with 2 AZs: [10.0.64.0/19, 10.0.96.0/19]
                     publicSubnetCidrs:
                       type: array
                       items:
                         type: string
                       description: >-
-                        Public subnet CIDRs for load balancers, one per AZ.
-                        Example: [10.0.192.0/24, 10.0.193.0/24, 10.0.194.0/24]
+                        Optional. Public subnet CIDRs for load balancers, one per AZ.
+                        Auto-computed from vpcCidr if omitted: cidrsubnet(vpcCidr, 8, 192+idx)
+                        giving /24 blocks at offset 192 (safely beyond all /19 private ranges).
+                        Example for 10.0.0.0/16 with 2 AZs: [10.0.192.0/24, 10.0.193.0/24]
                     singleNatGateway:
                       type: boolean
                       default: false
