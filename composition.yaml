@@ -69,21 +69,10 @@ spec:
               - type: None
 
     # -------------------------------------------------------------------------
-    # Step 3 — Generate all VPC resources dynamically via go-templating.
-    # Resources created:
-    #   - VPC, InternetGateway
-    #   - N EKS node subnets, N resource subnets, N public subnets (one per AZ)
-    #   - N EIPs + N NAT Gateways (or 1 if singleNatGateway)
-    #   - Public route table + IGW route + N associations
-    #   - Private route table(s) + NAT GW route(s) + N associations
-    #   - Intra route table + N associations
-    #   - Security Groups: eks-nodes, eks-control-plane, aws-resources,
-    #     vpc-endpoints (conditional)
-    #   - All security group ingress/egress rules
-    #   - VPC interface + gateway endpoints (conditional on enableVpcEndpoints)
-    # Status fields written back to the composite resource after each reconcile.
+    # Step 3 — VPC core: VPC, IGW, and all subnets.
+    # Only step that contains the CIDR auto-computation logic.
     # -------------------------------------------------------------------------
-    - step: generate-resources
+    - step: vpc-core
       functionRef:
         name: function-go-templating
       input:
@@ -93,22 +82,10 @@ spec:
         inline:
           template: |
             {{- $params  := .observed.composite.resource.spec.parameters }}
-            {{- $name    := .observed.composite.resource.metadata.name }}
             {{- $obs     := default (dict) .observed.resources }}
             {{- $clsName := printf "%s-eks" $params.friendlyName }}
-            {{- $pcRef   := $name }}
+            {{- $pcRef   := .observed.composite.resource.metadata.name }}
 
-            {{- /* ----------------------------------------------------------------
-                 Helpers
-                 ---------------------------------------------------------------- */}}
-            {{- $commonTags := dict
-                  "env"    $params.env
-                  "bu_id"  $params.buId
-            }}
-
-            {{- /* Build a readiness map: composition-resource-name -> "True" if Ready=True in observed.
-                 function-go-templating does not auto-propagate readiness; we must set the
-                 gotemplating.fn.crossplane.io/ready annotation explicitly on each resource. */}}
             {{- $readyMap := dict }}
             {{- range $crn, $res := $obs }}
             {{- range $res.resource.status.conditions }}
@@ -173,13 +150,6 @@ spec:
             {{- end }}
             {{- end }}
 
-            {{- /* Interface endpoint service names */}}
-            {{- $ifaceEndpoints := list "ssm" "ssmmessages" "ec2messages" "kms" "ecr.api" "ecr.dkr" "ec2" "sts" "logs" }}
-            {{- $gwEndpoints    := list "s3" "dynamodb" }}
-
-            {{- /* ----------------------------------------------------------------
-                 VPC
-                 ---------------------------------------------------------------- */}}
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
             kind: VPC
@@ -204,9 +174,6 @@ spec:
               providerConfigRef:
                 name: {{ $pcRef }}
 
-            {{- /* ----------------------------------------------------------------
-                 Internet Gateway — vpcIdSelector picks the VPC above by label
-                 ---------------------------------------------------------------- */}}
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
             kind: InternetGateway
@@ -232,9 +199,6 @@ spec:
               providerConfigRef:
                 name: {{ $pcRef }}
 
-            {{- /* ----------------------------------------------------------------
-                 Subnets — one per AZ per tier
-                 ---------------------------------------------------------------- */}}
             {{- range $i, $az := $params.azs }}
 
             ---
@@ -331,11 +295,33 @@ spec:
 
             {{- end }}{{/* end range azs */}}
 
-            {{- /* ----------------------------------------------------------------
-                 EIPs and NAT Gateways
-                 singleNatGateway=true  → 1 EIP + 1 NAT GW in AZ[0]'s public subnet
-                 singleNatGateway=false → 1 EIP + 1 NAT GW per AZ
-                 ---------------------------------------------------------------- */}}
+    # -------------------------------------------------------------------------
+    # Step 4 — NAT infrastructure: EIPs and NAT Gateways.
+    # singleNatGateway=true  → 1 EIP + 1 NAT GW in AZ[0]'s public subnet
+    # singleNatGateway=false → 1 EIP + 1 NAT GW per AZ
+    # -------------------------------------------------------------------------
+    - step: nat
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params := .observed.composite.resource.spec.parameters }}
+            {{- $obs    := default (dict) .observed.resources }}
+            {{- $pcRef  := .observed.composite.resource.metadata.name }}
+
+            {{- $readyMap := dict }}
+            {{- range $crn, $res := $obs }}
+            {{- range $res.resource.status.conditions }}
+            {{- if and (eq .type "Ready") (eq .status "True") }}
+            {{- $readyMap = merge $readyMap (dict $crn "True") }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
             {{- $natAzs := $params.azs }}
             {{- if $params.singleNatGateway }}{{- $natAzs = slice $params.azs 0 1 }}{{- end }}
 
@@ -397,11 +383,33 @@ spec:
                 name: {{ $pcRef }}
             {{- end }}{{/* end range natAzs */}}
 
-            {{- /* ----------------------------------------------------------------
-                 Route Tables + Routes + Associations
-                 ---------------------------------------------------------------- */}}
+    # -------------------------------------------------------------------------
+    # Step 5 — Routing: route tables, routes, and subnet associations.
+    # Public RT shared; private RTs are 1 (singleNatGateway) or N per AZ.
+    # Intra RT for resource subnets has no internet route.
+    # -------------------------------------------------------------------------
+    - step: routing
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params := .observed.composite.resource.spec.parameters }}
+            {{- $obs    := default (dict) .observed.resources }}
+            {{- $pcRef  := .observed.composite.resource.metadata.name }}
 
-            {{- /* Public route table — shared across all public subnets */}}
+            {{- $readyMap := dict }}
+            {{- range $crn, $res := $obs }}
+            {{- range $res.resource.status.conditions }}
+            {{- if and (eq .type "Ready") (eq .status "True") }}
+            {{- $readyMap = merge $readyMap (dict $crn "True") }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
             kind: RouteTable
@@ -477,9 +485,6 @@ spec:
                 name: {{ $pcRef }}
             {{- end }}
 
-            {{- /* Private route tables for EKS node subnets.
-                 singleNatGateway=true  → 1 shared table + 1 route pointing to natgw-0
-                 singleNatGateway=false → 1 table per AZ pointing to its own natgw */}}
             {{- if $params.singleNatGateway }}
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
@@ -693,9 +698,31 @@ spec:
                 name: {{ $pcRef }}
             {{- end }}
 
-            {{- /* ----------------------------------------------------------------
-                 Security Groups
-                 ---------------------------------------------------------------- */}}
+    # -------------------------------------------------------------------------
+    # Step 6 — Security groups and rules.
+    # SGs: eks-nodes, eks-control-plane, aws-resources.
+    # -------------------------------------------------------------------------
+    - step: security-groups
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params := .observed.composite.resource.spec.parameters }}
+            {{- $obs    := default (dict) .observed.resources }}
+            {{- $pcRef  := .observed.composite.resource.metadata.name }}
+
+            {{- $readyMap := dict }}
+            {{- range $crn, $res := $obs }}
+            {{- range $res.resource.status.conditions }}
+            {{- if and (eq .type "Ready") (eq .status "True") }}
+            {{- $readyMap = merge $readyMap (dict $crn "True") }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
 
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
@@ -961,9 +988,36 @@ spec:
               providerConfigRef:
                 name: {{ $pcRef }}
 
-            {{- /* ----------------------------------------------------------------
-                 VPC Endpoints (conditional on enableVpcEndpoints)
-                 ---------------------------------------------------------------- */}}
+    # -------------------------------------------------------------------------
+    # Step 7 — VPC endpoints (conditional on enableVpcEndpoints).
+    # Endpoint SG + 9 interface endpoints + 2 gateway endpoints.
+    # external-name is stamped from observed state to prevent duplicate creation.
+    # -------------------------------------------------------------------------
+    - step: vpc-endpoints
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params := .observed.composite.resource.spec.parameters }}
+            {{- $obs    := default (dict) .observed.resources }}
+            {{- $pcRef  := .observed.composite.resource.metadata.name }}
+
+            {{- $readyMap := dict }}
+            {{- range $crn, $res := $obs }}
+            {{- range $res.resource.status.conditions }}
+            {{- if and (eq .type "Ready") (eq .status "True") }}
+            {{- $readyMap = merge $readyMap (dict $crn "True") }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+
+            {{- $ifaceEndpoints := list "ssm" "ssmmessages" "ec2messages" "kms" "ecr.api" "ecr.dkr" "ec2" "sts" "logs" }}
+            {{- $gwEndpoints    := list "s3" "dynamodb" }}
+
             {{- if $params.enableVpcEndpoints }}
 
             ---
@@ -1042,41 +1096,6 @@ spec:
               providerConfigRef:
                 name: {{ $pcRef }}
 
-            {{- /* Collect EKS node subnet IDs from observed state for endpoint placement */}}
-            {{- $eksSubnetIds := list }}
-            {{- range $i, $az := $params.azs }}
-            {{- $subnetKey := printf "subnet-eks-%d" $i }}
-            {{- if index $obs $subnetKey }}
-            {{- $id := (index $obs $subnetKey).resource.status.atProvider.id }}
-            {{- if $id }}{{- $eksSubnetIds = append $eksSubnetIds $id }}{{- end }}
-            {{- end }}
-            {{- end }}
-
-            {{- /* Collect private + intra route table IDs for gateway endpoints */}}
-            {{- $rtIds := list }}
-            {{- range $i, $az := $params.azs }}
-            {{- $rtKey := printf "rt-private-%d" $i }}
-            {{- if index $obs $rtKey }}
-            {{- $id := (index $obs $rtKey).resource.status.atProvider.id }}
-            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
-            {{- end }}
-            {{- end }}
-            {{- if $params.singleNatGateway }}
-            {{- if index $obs "rt-private-0" }}
-            {{- $id := (index $obs "rt-private-0").resource.status.atProvider.id }}
-            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
-            {{- end }}
-            {{- end }}
-            {{- if index $obs "rt-intra" }}
-            {{- $id := (index $obs "rt-intra").resource.status.atProvider.id }}
-            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
-            {{- end }}
-            {{- if index $obs "rt-public" }}
-            {{- $id := (index $obs "rt-public").resource.status.atProvider.id }}
-            {{- if $id }}{{- $rtIds = append $rtIds $id }}{{- end }}
-            {{- end }}
-
-            {{- /* Interface endpoints */}}
             {{- range $svc := $ifaceEndpoints }}
             {{- $safeKey := $svc | replace "." "-" }}
             {{- $epKey := printf "vpce-iface-%s" $safeKey }}
@@ -1114,7 +1133,6 @@ spec:
                 name: {{ $pcRef }}
             {{- end }}{{/* end range ifaceEndpoints */}}
 
-            {{- /* Gateway endpoints */}}
             {{- range $svc := $gwEndpoints }}
             {{- $gwKey := printf "vpce-gw-%s" $svc }}
             {{- $gwId := "" }}
@@ -1152,43 +1170,56 @@ spec:
 
             {{- end }}{{/* end if enableVpcEndpoints */}}
 
-            {{- /* ----------------------------------------------------------------
-                 Write status back to the composite resource.
-                 IDs are read from .observed.resources (available from 2nd reconcile).
-                 ---------------------------------------------------------------- */}}
-            {{- $vpcId    := "" }}
+    # -------------------------------------------------------------------------
+    # Step 8 — Write status back to the composite resource.
+    # IDs are read from .observed.resources (available from 2nd reconcile).
+    # -------------------------------------------------------------------------
+    - step: write-status
+      functionRef:
+        name: function-go-templating
+      input:
+        apiVersion: gotemplating.fn.crossplane.io/v1beta1
+        kind: GoTemplate
+        source: Inline
+        inline:
+          template: |
+            {{- $params := .observed.composite.resource.spec.parameters }}
+            {{- $name   := .observed.composite.resource.metadata.name }}
+            {{- $obs    := default (dict) .observed.resources }}
+
+            {{- $vpcId     := "" }}
             {{- $nodesSgId := "" }}
-            {{- $cpSgId   := "" }}
-            {{- $resSgId  := "" }}
+            {{- $cpSgId    := "" }}
+            {{- $resSgId   := "" }}
             {{- if index $obs "vpc" }}{{- $vpcId = (index $obs "vpc").resource.status.atProvider.id }}{{- end }}
             {{- if index $obs "sg-eks-nodes" }}{{- $nodesSgId = (index $obs "sg-eks-nodes").resource.status.atProvider.id }}{{- end }}
             {{- if index $obs "sg-eks-control-plane" }}{{- $cpSgId = (index $obs "sg-eks-control-plane").resource.status.atProvider.id }}{{- end }}
             {{- if index $obs "sg-aws-resources" }}{{- $resSgId = (index $obs "sg-aws-resources").resource.status.atProvider.id }}{{- end }}
 
-            {{- $eksSubnetStatusIds := list }}
+            {{- $eksSubnetIds := list }}
             {{- range $i, $az := $params.azs }}
             {{- $key := printf "subnet-eks-%d" $i }}
             {{- if index $obs $key }}
             {{- $id := (index $obs $key).resource.status.atProvider.id }}
-            {{- if $id }}{{- $eksSubnetStatusIds = append $eksSubnetStatusIds $id }}{{- end }}
+            {{- if $id }}{{- $eksSubnetIds = append $eksSubnetIds $id }}{{- end }}
             {{- end }}
             {{- end }}
 
-            {{- $resSubnetStatusIds := list }}
+            {{- $resSubnetIds := list }}
             {{- range $i, $az := $params.azs }}
             {{- $key := printf "subnet-res-%d" $i }}
             {{- if index $obs $key }}
             {{- $id := (index $obs $key).resource.status.atProvider.id }}
-            {{- if $id }}{{- $resSubnetStatusIds = append $resSubnetStatusIds $id }}{{- end }}
+            {{- if $id }}{{- $resSubnetIds = append $resSubnetIds $id }}{{- end }}
             {{- end }}
             {{- end }}
 
-            {{- $pubSubnetStatusIds := list }}
+            {{- $pubSubnetIds := list }}
             {{- range $i, $az := $params.azs }}
             {{- $key := printf "subnet-pub-%d" $i }}
             {{- if index $obs $key }}
             {{- $id := (index $obs $key).resource.status.atProvider.id }}
-            {{- if $id }}{{- $pubSubnetStatusIds = append $pubSubnetStatusIds $id }}{{- end }}
+            {{- if $id }}{{- $pubSubnetIds = append $pubSubnetIds $id }}{{- end }}
             {{- end }}
             {{- end }}
 
@@ -1203,24 +1234,24 @@ spec:
               controlPlaneSecurityGroupId: {{ $cpSgId | quote }}
               resourcesSecurityGroupId: {{ $resSgId | quote }}
               eksNodeSubnetIds:
-                {{- if $eksSubnetStatusIds }}
-                {{- range $eksSubnetStatusIds }}
+                {{- if $eksSubnetIds }}
+                {{- range $eksSubnetIds }}
                 - {{ . | quote }}
                 {{- end }}
                 {{- else }}
                 []
                 {{- end }}
               resourceSubnetIds:
-                {{- if $resSubnetStatusIds }}
-                {{- range $resSubnetStatusIds }}
+                {{- if $resSubnetIds }}
+                {{- range $resSubnetIds }}
                 - {{ . | quote }}
                 {{- end }}
                 {{- else }}
                 []
                 {{- end }}
               publicSubnetIds:
-                {{- if $pubSubnetStatusIds }}
-                {{- range $pubSubnetStatusIds }}
+                {{- if $pubSubnetIds }}
+                {{- range $pubSubnetIds }}
                 - {{ . | quote }}
                 {{- end }}
                 {{- else }}
