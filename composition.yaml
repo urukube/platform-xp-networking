@@ -1079,14 +1079,22 @@ spec:
             {{- /* Interface endpoints */}}
             {{- range $svc := $ifaceEndpoints }}
             {{- $safeKey := $svc | replace "." "-" }}
+            {{- $epKey := printf "vpce-iface-%s" $safeKey }}
+            {{- $epId := "" }}
+            {{- if index $obs $epKey }}
+            {{- $epId = (index $obs $epKey).resource.status.atProvider.id }}
+            {{- end }}
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
             kind: VPCEndpoint
             metadata:
               annotations:
-                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-iface-%s" $safeKey }}
-                {{- if index $readyMap (printf "vpce-iface-%s" $safeKey) }}
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ $epKey }}
+                {{- if index $readyMap $epKey }}
                 gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
+                {{- if $epId }}
+                crossplane.io/external-name: {{ $epId }}
                 {{- end }}
             spec:
               forProvider:
@@ -1108,14 +1116,22 @@ spec:
 
             {{- /* Gateway endpoints */}}
             {{- range $svc := $gwEndpoints }}
+            {{- $gwKey := printf "vpce-gw-%s" $svc }}
+            {{- $gwId := "" }}
+            {{- if index $obs $gwKey }}
+            {{- $gwId = (index $obs $gwKey).resource.status.atProvider.id }}
+            {{- end }}
             ---
             apiVersion: ec2.aws.upbound.io/v1beta1
             kind: VPCEndpoint
             metadata:
               annotations:
-                gotemplating.fn.crossplane.io/composition-resource-name: {{ printf "vpce-gw-%s" $svc }}
-                {{- if index $readyMap (printf "vpce-gw-%s" $svc) }}
+                gotemplating.fn.crossplane.io/composition-resource-name: {{ $gwKey }}
+                {{- if index $readyMap $gwKey }}
                 gotemplating.fn.crossplane.io/ready: "True"
+                {{- end }}
+                {{- if $gwId }}
+                crossplane.io/external-name: {{ $gwId }}
                 {{- end }}
             spec:
               forProvider:
